@@ -217,3 +217,127 @@ producing wrong logits with no error signal anywhere". If re-syncing is
 considered out of scope upstream, the minimal alternative is for
 `TieringOffloadingSpec` to **refuse to start** when the tier manager's region is
 not shared by every rank, rather than silently serving wrong KV.
+
+
+---
+
+## Patch 03 — matching decoupled from staging (2026-09-08)
+
+**Patches 01 and 02 make the disk tier *correct*. They do not make it *useful*
+on a prefix larger than your primary tier. This one does.**
+
+If you applied this mod before 03 existed and saw the tier do nothing — no
+error, no warning, just persistent zero hits — this is why.
+
+### The bug
+
+`TieringOffloadingManager.lookup` ends:
+
+```python
+return LookupResult.MISS if not promoted else LookupResult.RETRY
+```
+
+The matching walk promoted **one primary-tier row per queried key**, purely to
+confirm the key was there. Once the tier filled, every subsequent key — *including
+keys sitting on disk* — returned `MISS`, indistinguishable from "never stored".
+The cross-group AND (`if num_hit_chunks == 0: return 0`) then discarded the whole
+external hit.
+
+Self-reinforcing: the walk consumed the rows `prepare_store` needed, so the tier
+stopped being **written** too, and never recovered on its own.
+
+**This will hit most users of this image.** The tier is sized from host RAM and
+these are 128 GB boxes; with a large model resident, `cpu_bytes_to_use` of a few
+GiB buys only a few hundred rows. A long agent conversation queries far more keys
+than that in a single match. On our 4 GiB / 498-row tier, a 242k-token prefix
+queried **12,434** keys.
+
+### The 30-second diagnosis
+
+Sum the per-group RETRY counts on a vetoed lookup. **If the sum pins at exactly
+your tier's row count, you are hitting this and your data is on disk.** Confirm
+the row count independently from metric granularity: `kv_offload_cpu_cache_usage_perc`
+only ever takes values `k/rows` (ours reported `0.08032128514056225` = `40/498`).
+
+Do not read a high miss count as disk absence without checking this first. That
+misreading cost us two weeks.
+
+### The fix
+
+Match with `promote=False`, then stage the confirmed hit in **waves** so a hit
+larger than the tier can still be served. Three new stdlib-only modules
+(`wave_slicer.py`, `parking_gate.py`, `parking_sm.py`), each with host-runnable
+tests, plus the driver in `scheduler.py` and the `promote` flag in `manager.py`.
+
+### Measured on a live 2-node TP=2 DeepSeek-V4-Flash-0731 cluster
+
+| | before | after |
+|---|---|---|
+| summed RETRY per probe | 498 | **0** |
+| `exit=ZERO` | 14 | **0** |
+| `cannot store chunks` | 2 | **0** |
+| cold 294,186-token prompt | `ext=0` | **`ext=290,816`** (98.9%) |
+
+Also verified since:
+
+- **Multi-wave really runs.** 23 loads at `num_waves=2`/`3`. Slicing exact:
+  `ext=305152 wave_sizes=[64, 64, 26]` is 64+64+21 = 149 g0 chunks =
+  305152/2048, sliding-window groups riding the last wave. Blocks close end to
+  end: 512+512+190 = 1214 = 149x8 + 22.
+- **Both ranks.** Same job ids and `src_blocks` on each; rank 1 emits the
+  matching `cpu_to_gpu` transfers. The `src_offset`/`dst_offset` asserts survive
+  wave boundaries.
+- **Streaming beats tier size.** A **1 GiB (124-row)** tier served a cold
+  **348,000-token** prompt at `ext=346112` — **99.5%**. That prefix needs ~170
+  rows to stage, so it is monolithically impossible; only waves can do it.
+- **Output is not degraded.** Next-token distribution from tier-served KV is
+  *within the engine's own noise floor*, and equal to vLLM's own GPU prefix
+  cache (2.95 vs 2.93, floor 3.20). Tooling: `tools/kv-quality-ab.py` in our
+  repo.
+- **Parking works** (16 slot events, all released, no hang) but is **OFF by
+  default** — `VLLM_OFFLOAD_PARK=1` to enable. Treat it as the least-exercised
+  part of this patch.
+
+### Tuning
+
+| var | default | meaning |
+|---|---|---|
+| `VLLM_OFFLOAD_STREAM_WAVE_CHUNKS` | 64 | chunks per wave. **0 makes this patch fully inert** — the fastest revert, verified by a dark baseline. |
+| `VLLM_OFFLOAD_PARK` | 0 | admission gate. Only reachable when a request's demand exceeds half the tier. |
+
+A wave holds `WAVE_CHUNKS x tokens_per_chunk` tokens. At 256 and a 2048-token
+chunk that is 524,288 — larger than most workloads, so it never splits. If you
+want waves to actually engage, size it against your prefixes.
+
+### Honest scope
+
+- Ships ~70 lines of **env-gated diagnostics** (`KVPROBE`/`KVCOV`/`KVPROV` and a
+  shadow load-solver), all inert unless their env var is set. They are the
+  instruments that found this; removing them by hand would ship code we have not
+  run.
+- **`cannot store chunks` is a separate, pre-existing failure, and you should
+  expect to meet it.** `prepare_store` cannot allocate rows, and that path
+  neither advances the cursor nor backs off nor throttles its log — so the
+  request retries the identical oversized batch on *every* scheduler step.
+  Measured on our workload (~250-350k-token prompts):
+
+  | `cpu_bytes_to_use` | rows | `cannot store chunks` |
+  |---|---|---|
+  | 1 GiB | 124 | **8,870** lines from 40 requests, worst one 1,847x, ~218/min |
+  | 2 GiB | 249 | **0** |
+
+  So: **raise `cpu_bytes_to_use` until it stops.** The right value scales with
+  your prompt length, not with this table — a store batch is
+  `num_offloadable_tokens / tokens_per_chunk` summed over groups, and the
+  sliding-window groups dominate it (a 348k prompt wants ~17,800 chunk-rows in
+  total, of which 91% are g3/g4 at 32- and 64-token chunks).
+
+  Note this is **not** what `VLLM_OFFLOAD_STREAM_WAVE_CHUNKS` controls — wave
+  size governs the *load* path and is not referenced in the store path at all.
+  Halving it frees ~32 rows against a deficit in the hundreds.
+
+  Not introduced by 03 — but 03 makes small tiers useful enough that you may
+  now run one small enough to hit this.
+- Written with AI assistance and verified on the hardware above: a collaboration
+  between Claude Opus 5 and DeepSeek-V4-Flash reviewing each other's work. Every
+  number here is measured, not asserted by a model.
