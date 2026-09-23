@@ -432,3 +432,146 @@ ceiling.
 - vLLM #54914 reports the same assertion on stock vLLM without this mod. 04 fixes
   only the wave path and says nothing about that report's cause.
 - Written with AI assistance (Claude) and verified on that cluster.
+
+---
+
+## Patch 05 — staged wave rows held until their load retires (2026-09-22)
+
+**04 stopped the crash by re-staging a wave whose key went missing. It did not
+stop the eviction, and on our cluster that turned the crash into a stall of
+over 100 s.**
+
+### The bug
+
+`vllm:kv_offload_wave_retry_total{reason="miss"}` reached **207 in 15 h** of
+production traffic, and two concurrent cold restores (136,963- and
+163,907-token prompts) each hit the 50-step warning and sat **over 100 s**
+before serving. Both completed — no aborts, no errors — but 04's own
+measurement for a 175 K restore was 3.2 s.
+
+A wave's rows land at `ref_cnt 0` when `complete_write()` finishes their
+promotion, and only `prepare_load()` pins them, so in between they are
+evictable. `prepare_store` protects only the keys of the store it is serving.
+A store batch that is large relative to the tier fits only by evicting most of
+what is evictable, and a just-landed wave is evictable, so the sweep takes it.
+(A batch needing more rows than are *evictable* is refused outright — the
+"cannot store chunks" case in 03's scope — and evicts nothing.) Two concurrent
+restores evict each other the same way, and each re-stage re-reads the same
+keys from disk.
+
+### The fix
+
+The tiering manager holds a wave's rows from staging until the wave's load
+retires. Only a *wave's* rows are held:
+
+- `promote_for_staging()` records the whole wave in `wave_expect`, and holds
+  the wave's keys that are already resident and readable. Those are not part
+  of its reservation (`prepare_write` reserves only keys the tier lacks), so
+  losing one would send the whole wave back for another read.
+- Whenever rows become readable — a promotion completing, or a GPU store
+  completing — `_hold_for_waiting_waves()` takes one `prepare_load()` hold on
+  each of them **for every request whose wave expects it**. Expectations are
+  per request, so holds are too: a key a wave shares with another request's
+  read or store is held for this wave as well, and each request releases only
+  its own hold. The non-streaming path promotes a row for every key it merely
+  *queries*; no wave expects those, so they are never held, and with
+  `VLLM_OFFLOAD_STREAM_WAVE_CHUNKS=0` this patch is inert.
+
+Every hold is released on exactly one of these:
+
+- `complete_load()` — the wave's load retires (releases the keys it consumed,
+  and drops them from `wave_expect`, so a finished wave expects nothing);
+- `release_wave_pins()` — the driver releases before re-staging after a MISS,
+  which also clears `wave_expect`, so a promotion landing afterwards takes no
+  hold;
+- `_maybe_finalize_request()` — the request finishes, before its state is
+  dropped, so an aborted request cannot strand rows;
+- `reset_cache()` — forgets them, since it drops every row and zeroes every
+  refcount anyway.
+
+### Why it cannot deadlock
+
+A deadlock needs a cycle in the wait-for graph, and a cycle needs someone who
+holds rows while waiting for rows. So the property to keep is: **a holder never
+waits for a row.**
+
+- Rows are only ever waited for at a reservation (`prepare_write()` /
+  `prepare_store()`), which is all-or-nothing: a refused reservation acquires
+  nothing and its caller retries on a later step. For a wave, that reservation
+  is in `promote_for_staging()`.
+- Every path back to `promote_for_staging()` releases first (MISS; a new wave
+  starts only after the previous one's `complete_load()`), so a wave that waits
+  for rows holds none. Preemption needs no case: a request holding staged rows
+  is waiting on its load, and only running requests are preempted.
+- A wave that holds rows is waiting only on I/O — its own promotion, or
+  another request's read or store (`HIT_PENDING`) — and in-flight I/O already
+  owns its rows and completes without acquiring any. Holds taken on another
+  request's behalf when rows land never wait either: those rows are already
+  resident.
+
+So every wait-for edge starts at something holding nothing, and no cycle can
+form. The driver also releases on a *refused* re-stage; by the argument above a
+wave there holds nothing already, so that call is a guard that makes
+hold-and-wait unrepresentable rather than merely unreachable.
+
+This matters at realistic sizes: a full wave is 64 full-attention chunks (the
+last wave of a request is the remainder, and also carries the sliding-window
+rows), and requests waiting on a restore are bounded by GPU blocks rather than
+`max_num_seqs`, so held waves can exceed a 573-row tier — twelve full waves
+already would.
+
+### Also fixed: a zero-key promotion job
+
+A wave whose keys are *all* already resident reserves nothing, yet
+`promote_for_staging()` still queued an entry and `_flush_pending_promotions()`
+submitted it with no keys. On the `fs` tier, `DualQueueThreadPool.enqueue_load()`
+increments `_inflight_jobs` and enqueues nothing, so the job never retires:
+`has_pending_work()` stays true forever and `wait_idle()` — hence
+`drain_jobs()` and `reset_cache()` — never returns. It is reachable whenever a
+wave's keys are warm. Zero-key entries are no longer submitted. (The wave itself
+still progresses: `wave_lookup()` answers HIT and it loads.)
+
+### Verified
+
+- `test-wave-lookup.py` (extended; no GPU needed) drives the real code paths
+  next to the 04 checks: a completed promotion is held and a competing store
+  cannot evict it; `promote_for_staging()` holds a wave's resident keys and
+  expects the whole wave; a key two waves share is held for both, whether it
+  lands from one request's read or from another request's store, and stays
+  held for the waiting wave after the reader is done with it; the hold is
+  released by the load, by a re-stage, and
+  at finalize through `on_request_finished()`; a promotion no
+  wave staged is not held; a zero-key entry is not submitted; and a landed,
+  released or finished wave leaves nothing in `wave_expect`. Holding only for
+  the request that did the read, dropping the store-path hold, the resident
+  hold, the finalize release, the expectation cleanup or the zero-key skip
+  each make it fail.
+- 01–05 apply with `git apply` on vLLM
+  `e2666d9a65f41fc376607531453cbd57c4c71016`, all touched files compile, and a
+  second `run.sh` skips.
+- vLLM's `tests/v1/kv_connector/unit/offloading_connector` and
+  `tests/v1/kv_offload`: same pass/fail set with and without 05 (403 passed;
+  GPU-dependent tests cannot run in our container either way).
+- Live on the same two-DGX-Spark TP=2 DeepSeek-V4-Flash-0731 cluster: zero
+  `wave_retry` samples of either reason since deploying, across concurrent cold
+  restores; a needle probe buried 25 % into a 101 K-token prompt restored
+  through the tier and came back exact.
+
+### Honest scope
+
+- **The trade.** A store can no longer evict a held row, so
+  `cannot store chunks` may appear more often on a tight tier. That is the right
+  way round — a store retries on its own, a stalled restore is user-visible.
+  Our tier is 4.08 GiB = 573 rows at `blocks_per_chunk=4`; rows scale with your
+  configuration, so read yours from `kv_offload_cpu_cache_usage_perc`'s
+  granularity (it only takes values `k/rows`).
+- **Starvation is not ruled out.** A wave can lose a key it did not hold,
+  re-read it, and lose it again; each cycle releases its holds, so others make
+  progress, but that one request can be starved. That is 03's OPEN A, and
+  `reason="miss"` climbing on one wave is its signature.
+- **Not fixed here, found while auditing:** a wave-streaming request aborted
+  while no load is in flight (still promoting, refused or re-staging) gets
+  `delay_free_blocks`, but the worker only reports `finished_recving` when a
+  load job retires, so its GPU blocks are never freed. That is in the
+  interaction with the core scheduler, not in this patch.
+- Written with AI assistance (Claude) and verified on that cluster.

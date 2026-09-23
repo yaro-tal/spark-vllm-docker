@@ -1,0 +1,220 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 823ea8b..8158796 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -2760,6 +2760,12 @@ class OffloadingConnectorScheduler:
+                     if self.manager.promote_for_staging(w.keys, req_status.req_context):
+                         w.promoting = True
+                     else:
++                        # Belt and braces: a wave reaching here holds nothing
++                        # (every path into `not w.promoting` released first),
++                        # but a refused re-stage waiting for rows while holding
++                        # rows would be the one hold-and-wait shape, so make it
++                        # unrepresentable rather than merely unreachable.
++                        self.manager.release_wave_pins(req_status.req_context)
+                         # NOT YET RESOLVED (left deliberately conservative --
+                         # see design §2's "define what happens when a later
+                         # wave's promotion is refused"): the design considered
+@@ -2797,6 +2803,11 @@ class OffloadingConnectorScheduler:
+                     )
+                     if readiness is LookupResult.MISS:
+                         w.promoting = False  # stage again next step
++                        # Let go of what this wave still holds: it has to
++                        # re-read a key, and a wave that waits for new rows
++                        # while holding others is the one shape that could
++                        # deadlock a fully held tier.
++                        self.manager.release_wave_pins(req_status.req_context)
+                         self._wave_retry(req_id, req_status.wave_idx, w, "miss")
+                         continue
+                     if readiness is not LookupResult.HIT:
+diff --git a/vllm/v1/kv_offload/tiering/manager.py b/vllm/v1/kv_offload/tiering/manager.py
+index e955642..3424973 100644
+--- a/vllm/v1/kv_offload/tiering/manager.py
++++ b/vllm/v1/kv_offload/tiering/manager.py
+@@ -76,6 +76,23 @@ class RequestState:
+     # time.monotonic() of this request's first deferred secondary-tier lookup;
+     # None once consumed (observed) or while no secondary lookup is pending.
+     secondary_lookup_start_time: float | None = None
++    # WAVE STREAMING. Keys this request promoted whose primary-tier rows are
++    # held non-evictable (ref_cnt >= 1) between the promotion completing and
++    # the wave's load retiring. Without that hold the rows are evictable the
++    # moment they land, and a store batch large relative to the tier fits only
++    # by evicting most of what is evictable -- which includes a just-landed
++    # wave -- so the wave re-stages and can starve. Released in complete_load(),
++    # when the wave re-stages, and on finalize/reset, so a hold can never
++    # outlive its request, its wave or its rows. (Preemption needs no case: a
++    # request holding these is waiting on its load, and only a running request
++    # is preempted.)
++    staged_pins: set[OffloadKey] = field(default_factory=set)
++    # Keys whose promotion a WAVE asked for (promote_for_staging). Only these
++    # are held when they land: the non-streaming path promotes a row for every
++    # key it merely QUERIES, and holding those would keep rows no load asks for
++    # until the request finishes -- with VLLM_OFFLOAD_STREAM_WAVE_CHUNKS=0 this
++    # patch must stay inert.
++    wave_expect: set[OffloadKey] = field(default_factory=set)
+ 
+ 
+ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
+@@ -282,6 +299,10 @@ class TieringOffloadingManager(OffloadingManager):
+                         self._promoted_rows.extend(
+                             int(b) for b in job_metadata.block_ids
+                         )
++                        # complete_write() above left these rows at ref_cnt 0,
++                        # i.e. evictable; hold them for every wave that is
++                        # waiting on them, not only the one that read them.
++                        self._hold_for_waiting_waves(job_metadata.keys)
+                 else:
+                     # primary→secondary transfer completed.
+                     # Decrement ref_cnt on primary blocks.
+@@ -511,6 +532,29 @@ class TieringOffloadingManager(OffloadingManager):
+         entry = tier_pending[ctx_id]
+         entry.keys.extend(primary_write_result.keys_to_store)
+         entry.block_ids.extend(store_spec.block_ids)
++
++        req_state = self._req_state.get(ctx_id)
++        if req_state is not None:
++            # The whole wave, not just what this reservation reads: a key
++            # another request is still reading or storing is not reserved here
++            # and not readable yet; _hold_for_waiting_waves() takes this wave's
++            # hold on it when that write completes.
++            req_state.wave_expect.update(keys)
++            # Hold the rest of the wave too. prepare_write reserves only the
++            # keys the tier does not already have, so a wave's resident keys
++            # would stay evictable while its promotion reads the others, and
++            # losing one of them sends the whole wave back for another read.
++            # Only keys readable now can be held here; the rest are held when
++            # they land.
++            resident = [
++                k
++                for k in keys
++                if k not in req_state.staged_pins
++                and self.primary_tier.lookup(k, req_context) is LookupResult.HIT
++            ]
++            if resident:
++                self.primary_tier.prepare_load(resident, req_context)
++                req_state.staged_pins.update(resident)
+         return True
+ 
+     def wave_lookup(
+@@ -558,6 +602,13 @@ class TieringOffloadingManager(OffloadingManager):
+ 
+         for tier, pending_by_ctx in self._pending_load_submissions.items():
+             for entry in pending_by_ctx.values():
++                if not entry.keys:
++                    # A wave whose keys are all resident reserves nothing, and a
++                    # zero-key job never completes on a tier that counts tasks
++                    # (fs: its thread pool increments the in-flight count and
++                    # enqueues nothing), which leaves has_pending_work() true
++                    # forever and hangs drain_jobs()/reset_cache().
++                    continue
+                 job_id = self._next_job_id()
+                 job_metadata = JobMetadata(
+                     job_id=job_id,
+@@ -619,6 +670,78 @@ class TieringOffloadingManager(OffloadingManager):
+             req_context: Per-request context.
+         """
+         self.primary_tier.complete_load(keys, req_context)
++        self._release_staged_pins(req_context.req_id, keys)
++
++    def _release_staged_pins(
++        self, req_id: str, keys: Collection[OffloadKey] | None = None
++    ) -> None:
++        """Drop the staging hold on `keys` (all of the request's pins when
++        None), so the rows become evictable again once nothing else reads them.
++
++        Called when a wave's load retires, when a wave re-stages (a wave holds
++        a complete staged set or nothing, so it never waits on new rows while
++        holding some), and when the request finalizes, so a request that never
++        loaded a staged wave cannot strand rows as non-evictable.
++
++        The expectation goes with the hold: once these keys are released no
++        wave expects them, so a later promotion of one (the non-streaming path
++        can promote any key it queries) is not held on a finished wave's behalf.
++        """
++        state = self._req_state.get(req_id)
++        if state is None:
++            return
++        if keys is None:
++            state.wave_expect.clear()
++        else:
++            state.wave_expect.difference_update(keys)
++        if not state.staged_pins:
++            return
++        pinned = (
++            state.staged_pins
++            if keys is None
++            else state.staged_pins.intersection(keys)
++        )
++        if not pinned:
++            return
++        self.primary_tier.complete_load(list(pinned), state.req_context)
++        state.staged_pins.difference_update(pinned)
++
++    def _hold_for_waiting_waves(self, keys: Collection[OffloadKey]) -> None:
++        """Hold each of `keys` that is now readable for every request whose
++        in-flight wave expects it.
++
++        Called whenever rows become readable: a promotion or a GPU store
++        completing. Expectations are per request, so holds are too. A key a
++        wave shares with another request's read or store must be held for this
++        wave as well, or it becomes evictable the moment the other request is
++        done with it. Each request takes and releases its own hold, so the
++        refcount stays balanced, and one hold per key per request (the
++        staged_pins check) because complete_load() releases exactly one.
++        Taking a hold here never waits: the rows are already resident.
++        """
++        for state in self._req_state.values():
++            wanted = [
++                k
++                for k in keys
++                if k in state.wave_expect
++                and k not in state.staged_pins
++                and self.primary_tier.lookup(k, state.req_context)
++                is LookupResult.HIT
++            ]
++            if not wanted:
++                continue
++            self.primary_tier.prepare_load(wanted, state.req_context)
++            state.staged_pins.update(wanted)
++            state.wave_expect.difference_update(wanted)
++
++    def release_wave_pins(self, req_context: ReqContext) -> None:
++        """Drop this request's staging holds because its wave is re-staging.
++
++        A wave that lost a key must re-read it, and rows are reserved for a
++        whole wave at once: holding the rest meanwhile would be hold-and-wait,
++        the one shape in which these holds could deadlock a full tier.
++        """
++        self._release_staged_pins(req_context.req_id)
+ 
+     @override
+     def prepare_store(
+@@ -733,6 +856,8 @@ class TieringOffloadingManager(OffloadingManager):
+         self.primary_tier.complete_store(keys, req_context, success)
+ 
+         if success:
++            # A wave may be waiting on a key this store just wrote.
++            self._hold_for_waiting_waves(keys)
+             # Step 2: Cascade to ALL secondary tiers
+             # For each secondary tier, call primary.prepare_read() to get the
+             # LoadStoreSpec AND to increment ref_cnt (protecting blocks from
+@@ -837,6 +962,7 @@ class TieringOffloadingManager(OffloadingManager):
+         if state.pending_primary_stores != 0:
+             return
+ 
++        self._release_staged_pins(req_id)
+         for tier in self.secondary_tiers:
+             if tier is exclude_tier:
+                 continue
+@@ -956,6 +1082,11 @@ class TieringOffloadingManager(OffloadingManager):
+         finished_req_ids = []
+         for req_id, state in self._req_state.items():
+             state.pending_primary_stores = 0
++            # primary_tier.reset_cache() below drops every row and zeroes all
++            # refcounts, so releasing these holds one by one would be pointless
++            # work on rows that are about to disappear.
++            state.staged_pins.clear()
++            state.wave_expect.clear()
+             if not state.is_finished:
+                 continue
+             for tier in self.secondary_tiers:
