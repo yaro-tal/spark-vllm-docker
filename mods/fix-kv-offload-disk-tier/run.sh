@@ -10,6 +10,7 @@ PATCHES=(
   "02-multinode-promoted-row-resync.patch"
   "03-match-without-staging.patch"
   "04-wave-readiness-at-load.patch"
+  "05-hold-staged-wave-rows.patch"
 )
 
 if ! command -v git >/dev/null 2>&1; then
@@ -40,7 +41,7 @@ if git apply --reverse --check "$MOD_DIR/$LAST" 2>/dev/null; then
   exit 0
 fi
 
-# Applied in order: 02 touches scheduler.py after 01 does, 03 after both, 04 after 03.
+# Applied in order: each patch was generated against the ones before it.
 for patch in "${PATCHES[@]}"; do
   file="$MOD_DIR/$patch"
   if git apply --reverse --check "$file" 2>/dev/null; then
@@ -59,7 +60,8 @@ echo "=====> Disk-backed KV offload tier: EAGLE/MTP store filter + multi-node re
 echo "=====> + matching decoupled from staging (03), which is what makes the tier"
 echo "=====> actually usable on a prefix larger than your primary tier,"
 echo "=====> + wave readiness evaluated at load (04), which fixes a prepare_load"
-echo "=====> crash after long uptimes."
+echo "=====> crash after long uptimes, and staged rows held until their load"
+echo "=====> retires (05), without which a restore can stall under store pressure."
 echo "=====> Set PYTHONHASHSEED so block hashes are stable across restarts."
 echo "=====> Tuning (all optional, sane defaults):"
 echo "=====>   VLLM_OFFLOAD_STREAM_WAVE_CHUNKS=64  chunks per wave; 0 = 03 and 04 fully inert"
