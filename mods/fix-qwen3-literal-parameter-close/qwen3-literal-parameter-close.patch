@@ -1,0 +1,90 @@
+--- a/vllm/parser/qwen3.py
++++ b/vllm/parser/qwen3.py
+@@ -48,13 +48,51 @@
+ PARAM_START = "<parameter="
+ PARAM_END = "</parameter>"
+ 
++# A </parameter> closes a value only when it is structural: followed, after
++# optional whitespace, by the next <parameter=, by </function>, by </tool_call>
++# or by the end of the arguments. A literal </parameter> inside a value (an XML
++# document, `echo '</parameter>'`) is part of the value.
++_PARAM_OPEN = r"<\s*parameter\s*=\s*([^>]*)>"
++_STRUCTURAL_NEXT = (
++    r"<\s*parameter\s*=|<\s*/\s*function\s*>|<\s*/\s*tool_call\s*>"
++)
+ _PARAM_RE = re.compile(
+-    r"<\s*parameter\s*=\s*([^>]*)>"
+-    r"(.*?)"
+-    r"(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\s*=))",
++    _PARAM_OPEN
++    + r"(.*?)"
++    + r"(?:<\s*/\s*parameter\s*>(?=\s*(?:" + _STRUCTURAL_NEXT + r"|$))"
++    + r"|(?=<\s*parameter\s*=))",
++    re.DOTALL,
++)
++# While streaming, a </parameter> at the end of the buffer is not yet known to
++# be structural, so end-of-buffer does not close a parameter.
++_PARAM_STREAMING_RE = re.compile(
++    _PARAM_OPEN
++    + r"(.*?)"
++    + r"(?:<\s*/\s*parameter\s*>(?=\s*(?:" + _STRUCTURAL_NEXT + r"))"
++    + r"|(?=<\s*parameter\s*=))",
+     re.DOTALL,
+ )
+ _PARTIAL_PARAM_RE = re.compile(r"<\s*parameter\s*=\s*([^>]+)>(.*)$", re.DOTALL)
++_STRUCTURAL_TAGS = (PARAM_START, FUNC_END, TOOL_CALL_END)
++
++
++def _withhold_undecided_tail(value: str) -> str:
++    """Cut what cannot yet be attributed to a value that is still growing.
++
++    The engine streams a JSON prefix and drops a call's arguments if a later
++    snapshot does not extend an earlier one, so a trailing </parameter> (or a
++    half-received tag) must not be emitted before what follows decides whether
++    it is structural or literal.
++    """
++    i = value.rfind(PARAM_END)
++    if i != -1:
++        rest = value[i + len(PARAM_END) :].lstrip()
++        if not rest or any(tag.startswith(rest) for tag in _STRUCTURAL_TAGS):
++            return value[:i]
++    for n in range(min(len(PARAM_END) - 1, len(value)), 0, -1):
++        if value.endswith(PARAM_END[:n]):
++            return value[:-n]
++    return value
+ 
+ 
+ def _trim_wrapping_newlines(value: str) -> str:
+@@ -69,19 +107,23 @@
+ def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
+     params: dict[str, object] = {}
+ 
+-    for match in _PARAM_RE.finditer(raw_args):
++    param_re = _PARAM_STREAMING_RE if partial else _PARAM_RE
++    for match in param_re.finditer(raw_args):
+         name = match.group(1)
+         value = match.group(2)
+         params[name] = _trim_wrapping_newlines(value)
+ 
+-    if partial:
+-        remaining = _PARAM_RE.sub("", raw_args)
+-        m = _PARTIAL_PARAM_RE.search(remaining)
+-        if m:
+-            name = m.group(1)
+-            value = m.group(2)
+-            if name:
+-                params[name] = _trim_wrapping_newlines(value)
++    # The last parameter when it has no structural close: still being streamed
++    # (partial), or the model stopped without closing it (final).
++    remaining = param_re.sub("", raw_args)
++    m = _PARTIAL_PARAM_RE.search(remaining)
++    if m:
++        name = m.group(1)
++        value = m.group(2)
++        if partial:
++            value = _withhold_undecided_tail(value)
++        if name:
++            params[name] = _trim_wrapping_newlines(value)
+ 
+     return json.dumps(params, ensure_ascii=False)
+ 
